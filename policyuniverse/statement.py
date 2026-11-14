@@ -42,7 +42,12 @@ ConditionTuple = namedtuple("Condition", "category value")
 class Statement(object):
     def __init__(self, statement):
         self.statement = statement
-        self.condition_entries = self._condition_entries()
+        self.condition_entry_groups = self._condition_entry_groups()
+        self.condition_entries = [
+            entry
+            for group in self.condition_entry_groups.values()
+            for entry in group
+        ]
         self.principals = self._principals()
         self.actions = self._actions()
 
@@ -143,7 +148,7 @@ class Statement(object):
         else:
             structure.add(value)
 
-    def _condition_entries(self):
+    def _condition_entry_groups(self):
         """Extracts any ARNs, Account Numbers, UserIDs, Usernames, CIDRs, VPCs, and VPC Endpoints from a condition block.
 
         Ignores any negated condition operators like StringNotLike.
@@ -165,11 +170,15 @@ class Statement(object):
         - VPC Endpoint
 
         https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html
+
+        Returns a dictionary mapping each (condition operator, condition key) pair to a list of ConditionTuples.
+        IAM evaluates distinct condition keys with AND semantics, while multiple values for a single
+        condition key are ORed together.  Grouping by key preserves that distinction for the caller.
         """
-        conditions = list()
+        condition_groups = dict()
         condition = self.statement.get("Condition")
         if not condition:
-            return conditions
+            return condition_groups
 
         key_mapping = {
             "aws:sourcearn": "arn",
@@ -212,21 +221,17 @@ class Statement(object):
                 for key, value in condition[condition_operator].items():
 
                     if key.lower() in key_mapping:
-                        if is_array(value):
-                            for v in value:
-                                conditions.append(
-                                    ConditionTuple(
-                                        value=v, category=key_mapping[key.lower()]
-                                    )
-                                )
-                        else:
-                            conditions.append(
+                        group_key = (condition_operator.lower(), key.lower())
+                        entries = condition_groups.setdefault(group_key, list())
+                        values = value if is_array(value) else [value]
+                        for v in values:
+                            entries.append(
                                 ConditionTuple(
-                                    value=value, category=key_mapping[key.lower()]
+                                    value=v, category=key_mapping[key.lower()]
                                 )
                             )
 
-        return conditions
+        return condition_groups
 
     @property
     def condition_arns(self):
@@ -288,15 +293,20 @@ class Statement(object):
         return False
 
     def is_condition_internet_accessible(self):
-        condition_entries = self.condition_entries
-        if len(condition_entries) == 0:
+        if not self.condition_entry_groups:
             return True
 
-        for entry in condition_entries:
-            if self._is_condition_entry_internet_accessible(entry):
-                return True
+        # Distinct condition keys are ANDed together, so every key must be
+        # internet accessible for the statement to be internet accessible.
+        # Multiple values for a single key are ORed together, so a key is
+        # internet accessible if any of its values is internet accessible.
+        for group in self.condition_entry_groups.values():
+            if not any(
+                self._is_condition_entry_internet_accessible(entry) for entry in group
+            ):
+                return False
 
-        return False
+        return True
 
     def _is_condition_entry_internet_accessible(self, entry):
         if entry.category == "arn":
